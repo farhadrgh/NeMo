@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,12 +27,13 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_batch_on_this_cp_rank
 from torch import nn
 
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.collections.llm import fn
 from nemo.collections.llm.fn.activation import quick_gelu
-from nemo.collections.llm.gpt.model.base import get_batch_on_this_context_parallel_rank, get_packed_seq_params
+from nemo.collections.llm.gpt.model.base import get_packed_seq_params
 from nemo.collections.llm.gpt.model.qwen2 import Qwen2Config
 from nemo.collections.vlm.layer_specs import get_layer_spec_te
 from nemo.collections.vlm.neva.model.base import MODEL_CONFIG_ATTR, restore_model_weights
@@ -76,7 +77,7 @@ def qwen2vl_data_step(dataloader_iter) -> Dict[str, torch.Tensor]:
         for key, val in _batch.items()
     }
     # slice batch along sequence dimension for context parallelism
-    output = get_batch_on_this_context_parallel_rank(_batch)
+    output = get_batch_on_this_cp_rank(_batch)
 
     return output
 
@@ -203,7 +204,7 @@ class Qwen2VLConfig(TransformerConfig, io.IOMixin):
             # https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct/blob/main/config.json
             self.language_transformer_config.mrope_section = [16, 24, 24]
 
-    def configure_model(self, tokenizer) -> "MCoreQwen2VLModel":
+    def configure_model(self, tokenizer, vp_stage: Optional[int] = None) -> "MCoreQwen2VLModel":
         # pylint: disable=C0115,C0116
         self.language_transformer_config.scatter_embedding_sequence_parallel = False
         self.language_transformer_config.tensor_model_parallel_size = self.tensor_model_parallel_size
@@ -223,16 +224,20 @@ class Qwen2VLConfig(TransformerConfig, io.IOMixin):
                 self.vision_transformer_config.tensor_model_parallel_size = self.encoder_tensor_model_parallel_size
                 self.vision_projection_config.tensor_model_parallel_size = self.encoder_tensor_model_parallel_size
 
+        # During fake lightning initialization, pass 0 to bypass the assertion that vp_stage must be
+        # non-None when using virtual pipeline model parallelism
+        vp_stage = vp_stage or 0
         model = MCoreQwen2VLModel(
             config=self,
             tokenizer=tokenizer,
-            pre_process=ps.is_pipeline_first_stage()
+            pre_process=ps.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
             or ps.get_pipeline_model_parallel_rank() == self.encoder_pipeline_model_parallel_size,
-            post_process=ps.is_pipeline_last_stage(),
-            add_encoder=ps.is_pipeline_first_stage(),
-            add_decoder=ps.is_pipeline_last_stage()
+            post_process=ps.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage),
+            add_encoder=ps.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage),
+            add_decoder=ps.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
             or ps.get_pipeline_model_parallel_rank() >= self.encoder_pipeline_model_parallel_size,
             drop_vision_class_token=self.drop_vision_class_token,
+            vp_stage=vp_stage,
         )
 
         return model
@@ -250,6 +255,7 @@ class MCoreQwen2VLModel(MCoreLLaVAModel):
         add_encoder: bool = True,
         add_decoder: bool = True,
         drop_vision_class_token: bool = False,
+        vp_stage: Optional[int] = None,
     ) -> None:
         # pylint: disable=C0115,C0116
         super(MCoreLLaVAModel, self).__init__(config=config)
@@ -262,6 +268,7 @@ class MCoreQwen2VLModel(MCoreLLaVAModel):
         self.post_process = post_process
         self.add_encoder = add_encoder
         self.add_decoder = add_decoder
+        self.vp_stage = vp_stage
 
         self.encoder_hidden_state = None
         self.vision_model = None
@@ -278,6 +285,7 @@ class MCoreQwen2VLModel(MCoreLLaVAModel):
                 tokenizer=tokenizer,
                 pre_process=pre_process,
                 post_process=post_process,
+                vp_stage=vp_stage,
             )
 
             self.share_embeddings_and_output_weights = self.language_model.share_embeddings_and_output_weights
@@ -813,10 +821,10 @@ class Qwen2VLModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNMixin)
         self._training_loss_reduction = None
         self._validation_loss_reduction = None
 
-    def configure_model(self) -> None:
+    def configure_model(self, vp_stage: Optional[int] = None) -> None:
         # pylint: disable=C0115,C0116
         if not hasattr(self, "module"):
-            self.module = self.config.configure_model(self.tokenizer)
+            self.module = self.config.configure_model(self.tokenizer, vp_stage=vp_stage)
 
     def forward(
         self,
