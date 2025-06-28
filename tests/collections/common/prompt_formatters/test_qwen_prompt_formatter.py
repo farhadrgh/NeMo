@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import torch
 
-from nemo.collections.common.prompts.mistral import MistralPromptFormatter
+from nemo.collections.common.prompts.qwen import QwenPromptFormatter
 
 
-def test_mistral_prompt_formatter_training(bpe_tokenizer):
-    formatter = MistralPromptFormatter(bpe_tokenizer)
+def test_qwen_prompt_formatter_training(bpe_tokenizer):
+    formatter = QwenPromptFormatter(bpe_tokenizer)
     ans = formatter.encode_dialog(
         [
             {"role": "user", "slots": {"message": "TEST"}},
@@ -25,15 +26,16 @@ def test_mistral_prompt_formatter_training(bpe_tokenizer):
     )
     assert set(ans) == {"input_ids", "context_ids", "answer_ids", "mask"}
     # fmt: off
-    assert bpe_tokenizer.ids_to_text(ans["input_ids"].tolist()) == '<s> [INST] TEST [/INST] TEST</s>'
-    assert bpe_tokenizer.ids_to_text(ans["context_ids"].tolist()) == '<s> [INST] TEST [/INST]'
-    assert bpe_tokenizer.ids_to_text(ans["answer_ids"].tolist()) == 'TEST</s>'
-    assert ans["mask"].shape[0] == ans["input_ids"].shape[0]
+    # The test tokenizer inserts an extra space, but it was verified that AutoTokenizer("Qwen/Qwen3-1.7B") doesn't.
+    assert bpe_tokenizer.ids_to_text(ans["input_ids"].tolist()) == '<|im_start|>user\nTEST<|im_end|>\n <|im_start|>assistant\nTEST<|im_end|>\n'
+    assert bpe_tokenizer.ids_to_text(ans["context_ids"].tolist()) == '<|im_start|>user\nTEST<|im_end|>\n'
+    assert bpe_tokenizer.ids_to_text(ans["answer_ids"].tolist()) == '<|im_start|>assistant\nTEST<|im_end|>\n'
+    assert torch.is_tensor(ans["mask"])
     # fmt: on
 
 
-def test_mistral_prompt_formatter_inference(bpe_tokenizer):
-    formatter = MistralPromptFormatter(bpe_tokenizer)
+def test_qwen_prompt_formatter_inference(bpe_tokenizer):
+    formatter = QwenPromptFormatter(bpe_tokenizer)
     ans = formatter.encode_dialog(
         [
             {"role": "user", "slots": {"message": "TEST"}},
@@ -41,6 +43,7 @@ def test_mistral_prompt_formatter_inference(bpe_tokenizer):
     )
     assert set(ans) == {"input_ids", "context_ids"}
     # fmt: off
+    # The test tokenizer inserts an extra space, but it was verified that AutoTokenizer("Qwen/Qwen3-1.7B") doesn't.
     assert ans["input_ids"].tolist() == ans["context_ids"].tolist()
-    assert bpe_tokenizer.ids_to_text(ans["input_ids"].tolist()) == '<s> [INST] TEST [/INST]'
+    assert bpe_tokenizer.ids_to_text(ans["input_ids"].tolist()) == '<|im_start|>user\nTEST<|im_end|>\n <|im_start|>assistant\n'
     # fmt: on
