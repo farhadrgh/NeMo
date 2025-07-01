@@ -56,6 +56,9 @@ except ImportError:
 
 try:
     from cuhyena.b2b_causal_conv1d import b2b_causal_conv1d
+    from cuhyena.fft_causal_conv1d import fft_causal_conv1d
+    from cuhyena.fft_causal_conv1d import is_supported as is_fused_supported
+    from cuhyena.rearrange import rearrange as cuhyena_rearrange
 except ImportError:
 
     def b2b_causal_conv1d(*args, **kwargs):
@@ -436,12 +439,9 @@ def fftconv_func(u, k, D, dropout_mask, gelu=True, k_rev=None, bidirectional=Fal
     fft_size = 2 * seqlen
 
     # check if k is less than seqlen
-    if k.shape[-1] < seqlen:
-        # Pad the filter k to the length of the input sequence u
-        k = torch.nn.functional.pad(k, (0, seqlen - k.shape[-1]))
-
     # bidirectional
     if bidirectional:
+        k = torch.nn.functional.pad(k, (0, seqlen - k.shape[-1]))
         u_f = torch.fft.rfft(u.to(dtype=k.dtype), n=fft_size)
 
         # split k along the channel dimension
@@ -462,17 +462,21 @@ def fftconv_func(u, k, D, dropout_mask, gelu=True, k_rev=None, bidirectional=Fal
 
     # causal
     else:
-        k_f = torch.fft.rfft(k, n=fft_size) / fft_size
-        if k_rev is not None:
-            k_rev_f = torch.fft.rfft(k_rev, n=fft_size) / fft_size
-            k_f = k_f + k_rev_f.conj()
+        if is_fused_supported(k.shape[-1]):
+            y = fft_causal_conv1d(u, k.squeeze(0))
+        else:
+            k = torch.nn.functional.pad(k, (0, seqlen - k.shape[-1]))
+            k_f = torch.fft.rfft(k, n=fft_size) / fft_size
+            if k_rev is not None:
+                k_rev_f = torch.fft.rfft(k_rev, n=fft_size) / fft_size
+                k_f = k_f + k_rev_f.conj()
 
-        u_f = torch.fft.rfft(u.to(dtype=k.dtype), n=fft_size)
+            u_f = torch.fft.rfft(u.to(dtype=k.dtype), n=fft_size)
 
-        if len(u.shape) > 3:
-            k_f = k_f.unsqueeze(1)
+            if len(u.shape) > 3:
+                k_f = k_f.unsqueeze(1)
 
-        y = torch.fft.irfft(u_f * k_f, n=fft_size, norm="forward")[..., :seqlen]
+            y = torch.fft.irfft(u_f * k_f, n=fft_size, norm="forward")[..., :seqlen]
 
     out = y + u * D.unsqueeze(-1)
     if gelu:
@@ -481,7 +485,6 @@ def fftconv_func(u, k, D, dropout_mask, gelu=True, k_rev=None, bidirectional=Fal
         return (out * rearrange(dropout_mask, "b H -> b H 1")).to(dtype=u.dtype)
     else:
         return out.to(dtype=u.dtype)
-
 
 class ImplicitModalFilter(nn.Module):
     """An implicit modal filter."""
@@ -838,12 +841,12 @@ class ParallelHyenaOperator(nn.Module):
 
         conv_bias = self.conv_bias
         local_size = None
-
+        
+        z = x2 * v
+        
         if cp_group is not None and len(torch.distributed.get_process_group_ranks(cp_group)) > 1:
 
-            x1, x2, v = [
-                AllToAllSingleFunction.apply(tensor, cp_group, "split_to_full", True) for tensor in [x1, x2, v]
-            ]
+            z = AllToAllSingleFunction.apply(z, cp_group, "split_to_full", True)
             # the tensors are now split across channels, but have full length.
             # [ B, H // num_ranks, L]
 
@@ -862,22 +865,31 @@ class ParallelHyenaOperator(nn.Module):
 
         h = h.repeat_interleave(self.group_dim, dim=-2)
 
-        z = x2 * v
+        # z = x2 * v
         # with torch.autocast("cuda"):
-        z = fftconv_func(
-            u=z.to(torch.float32),
-            k=h.to(torch.float32),
-            D=conv_bias.to(torch.float32),
-            dropout_mask=None,
-            gelu=False,
-            bidirectional=self.bidirectional,
-        )
+        if is_fused_supported(h.shape[-1]):
+            z = fftconv_func(
+                u=z.to(torch.float32),
+                k=h.to(torch.float32),
+                D=conv_bias.to(torch.float32),
+                dropout_mask=None,
+                gelu=False,
+                bidirectional=self.bidirectional,
+            )
+        else:
+            z = fftconv_func(
+                u=z,
+                k=h,
+                D=conv_bias,
+                dropout_mask=None,
+                gelu=False,
+                bidirectional=self.bidirectional,
+            )
         z = z.to(v.dtype)
-        z = x1 * z
-
         if cp_group is not None and len(torch.distributed.get_process_group_ranks(cp_group)) > 1:
             z = AllToAllSingleFunction.apply(z, cp_group, "full_to_split", True)
             # [ B, H, L // num_ranks]
+        z = x1 * z
         return z  # [B, (G, DG), L]
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
@@ -1270,11 +1282,10 @@ class B2BCausalConv1dModule(nn.Module):
             result = rearrange(result, "(nc b) h s -> b h (nc s)", nc=2)
         else:
             # Add proper causal padding for the non-CP case
-            x = torch.nn.functional.pad(x, (self.effective_pad_size, 0))
-
+            # x = torch.nn.functional.pad(x, (self.effective_pad_size, 0))
             # Call the CUDA kernel and remove the padding from result
             result = self.b2b_causal_conv1d_fn(x, proj_weight, mixer_weight, bias)
-            result = result[..., self.effective_pad_size :]  # Remove padding from output
+            # result = result[..., self.effective_pad_size :]  # Remove padding from output
         return result
 
 
